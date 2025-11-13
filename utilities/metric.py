@@ -1,6 +1,6 @@
 import math
 import torch
-
+import torchmetrics.functional as TMF
 class AveragePrecisionMeter(object):
     """
     The APMeter measures the average precision per class.
@@ -157,7 +157,46 @@ class AveragePrecisionMeter(object):
         AP = self.value2() * 100
         mAP = AP.mean()
         return mAP, AP
+    def auroc(self, num_classes):
+        """使用 torchmetrics 计算 AUROC"""
+        if self.scores.numel() == 0:
+            return 0.0, 0.0
 
+        auroc_list = []
+        # 遍历每个类别
+        for k in range(self.scores.size(1)):
+            class_scores = self.scores[:, k]
+            class_targets = self.targets[:, k]
+            
+            # AUROC 必须在 0/1 标签上计算
+            # 我们过滤掉 -1 (difficult) 标签
+            valid_mask = (class_targets != -1)
+            class_scores = class_scores[valid_mask]
+            class_targets = class_targets[valid_mask]
+            
+            # 确保该类别至少有正负两个样本
+            if len(torch.unique(class_targets)) < 2:
+                auroc_list.append(torch.tensor(float('nan')))
+                continue
+            
+            try:
+                # 使用 'binary' 任务计算单个类别的 AUROC
+                auc = TMF.auroc(
+                    class_scores.sigmoid(), # 将 Logits 转换为概率
+                    class_targets.long(),
+                    task='binary'
+                )
+                auroc_list.append(auc)
+            except ValueError:
+                 auroc_list.append(torch.tensor(float('nan')))
+        
+        auroc_tensor = torch.tensor(auroc_list)
+        # 计算宏平均 (忽略NaN)
+        mean_auroc = torch.nanmean(auroc_tensor)
+        
+        # 乘以 100 以匹配 mAP 的尺度
+        return mean_auroc * 100, auroc_tensor * 100
+    # --- 新方法结束 ---
     def overall(self):
         if self.scores.numel() == 0:
             return 0

@@ -186,29 +186,55 @@ class Engine(object):
         self.epoch_time = time.time() - self.epoch_time
         meter = self.meter
         loss = meter['loss'].average()
+        
         if utils_ddp.is_main_process():
             loss_all = meter['loss_all'].average()
+            
+            # --- 修改开始 ---
+            # 1. 定义哪些数据集使用 AUROC (统一转为大写以便比较)
+            auroc_datasets = ['NIH-CHEST', 'MIMIC', 'CHEXPERT'] 
+            
             if not is_train:
-                (mAP, AP) = meter['ap'].mAP()
+                # 检查是否为胸部X光数据集
+                if self.args.data_set.upper() in auroc_datasets:
+                    # 对于 NIH, MIMIC, CheXpert，使用 AUROC
+                    (main_metric, AP_or_AUC_list) = meter['ap'].auroc(self.args.num_classes)
+                    metric_name = 'AUROC' # 用于日志记录
+                else:
+                    # 对于其他 (VOC, COCO)，使用 mAP
+                    (main_metric, AP_or_AUC_list) = meter['ap'].mAP()
+                    metric_name = 'mAP'
+                
                 OP, OR, OF1, CP, CR, CF1 = meter['ap'].overall()
             else:
-            # 训练期间跳过 mAP 和 Overall 计算
-                mAP, AP = -1., torch.zeros(1) - 1
+                # 训练期间跳过计算
+                main_metric, AP_or_AUC_list = -1., torch.zeros(1) - 1
                 OP, OR, OF1, CP, CR, CF1 = (-1 for _ in range(6))
+                metric_name = 'mAP' # (训练时无所谓)
+            # --- 修改结束 ---
         else:
+            # --- 修改开始 (同步 else 块中的变量名) ---
             loss_all = torch.tensor(-1)
-            mAP, AP = -1, torch.zeros(1) - 1
+            main_metric, AP_or_AUC_list = -1, torch.zeros(1) - 1
             OP, OR, OF1, CP, CR, CF1 = (-1 for i in range(6))
-        # self.logger.info('end mAP')
+            metric_name = 'mAP' # (DDP-replica时无所谓)
+            # --- 修改结束 ---
+
         if self.args.distributed:
             utils_ddp.barrier()
 
-        result['precision']['mAP'].append(mAP)
-        result['precision']['AP'].append(AP)
+        # --- 修改开始 (使用新的动态变量) ---
+        result['precision']['mAP'].append(main_metric)
+        result['precision']['AP'].append(AP_or_AUC_list)
+        # --- 修改结束 ---
         result['epoch'].append(self.epoch)
         result['lr'].append(self.lr_curr)
         result['loss'].append(loss_all.item())
-        str_precision = f'OF1:{OF1:.2f}, CF1:{CF1:.2f}' + (f', mAP:{mAP:.4f}' if mAP != -1 else '')
+        
+        # --- 修改开始 (调整日志) ---
+        # (使用我们动态设置的 metric_name)
+        str_precision = f'OF1:{OF1:.2f}, CF1:{CF1:.2f}' + (f', {metric_name}:{main_metric:.4f}' if main_metric != -1 else '')
+        # --- 修改结束 ---
 
         is_best = False
         if is_train:
@@ -223,10 +249,12 @@ class Engine(object):
                                                    f'loss: {loss:.4f}, {str_precision} .'
             if self.args.print_verbose == 2 or self.args.evaluate == 0:
                 OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = meter['ap'].overall_topk(self.args.acc_top_k)
+                # --- 修改开始 (使用 AP_or_AUC_list) ---
                 str_verbose = f'\nOP: {OP:.2f}, OR: {OR:.2f}, OF1: {OF1:.2f}, CP: {CP:.2f}, CR: {CR:.2f}, CF1: {CF1:.2f}, ' \
                               f'OP_{self.args.acc_top_k}: {OP_k:.2f}, OR_{self.args.acc_top_k}: {OR_k:.2f}, ' \
                               f'OF1_{self.args.acc_top_k}: {OF1_k:.2f}, CP_{self.args.acc_top_k}: {CP_k:.2f}, ' \
-                              f'CR_{self.args.acc_top_k}: {CR_k:.2f}, CF1_{self.args.acc_top_k}: {CF1_k:.2f} \n {AP}.'
+                              f'CR_{self.args.acc_top_k}: {CR_k:.2f}, CF1_{self.args.acc_top_k}: {CF1_k:.2f} \n {AP_or_AUC_list}.'
+                # --- 修改结束 ---
             elif self.args.print_verbose == 1:
                 str_verbose = f'\nOP: {OP:.2f}, OR: {OR:.2f}, OF1: {OF1:.2f}, CP: {CP:.2f}, CR: {CR:.2f}, CF1: {CF1:.2f} .'
             else:
@@ -234,17 +262,21 @@ class Engine(object):
             str_end_epoch += str_verbose
             self.logger.info(str_end_epoch)
 
-            if result_best['precision']['mAP'] < mAP:
+            # --- 修改开始 (Best model 判定逻辑) ---
+            # (main_metric 现在可能是 mAP 或 AUROC，但比较逻辑不变)
+            if result_best['precision']['mAP'] < main_metric:
                 is_best = True
-                result_best['precision'] = {'mAP': mAP, 'AP': AP}
+                result_best['precision'] = {'mAP': main_metric, 'AP': AP_or_AUC_list}
                 result_best['epoch'] = self.epoch
                 result_best['loss'] = loss
 
+            # (使用我们动态设置的 metric_name)
             str_val_best = f"--[Test-best] (E{self.result['val_best']['epoch']}, " \
                            f"L{self.result['val_best']['loss']:.4f}), " \
-                           f"mAP: {self.result['val_best']['precision']['mAP']:.4f}"
+                           f"{metric_name}: {self.result['val_best']['precision']['mAP']:.4f}"
             str_val_best += ' .'
             self.logger.info(str_val_best)
+            # --- 修改结束 ---
 
         if self.args.evaluate != 0 and utils_ddp.is_main_process():
             self.save_checkpoint(is_train, is_best)
@@ -389,7 +421,17 @@ class Engine(object):
     def reset_meters(self):
         self.meter['loss'] = metric.AverageMeter('loss')
         self.meter['loss_all'] = metric.AverageMeter('loss all rank')
-        self.meter['ap'] = metric.AveragePrecisionMeter()
+        
+        # --- 扩展修改 ---
+        # 只有 VOC2007 使用 -1 标签，需要 difficult_examples=True
+        if self.args.data_set == 'VOC2007':
+            use_difficult = True
+        else:
+            # NIH, COCO, (以及 CheXpert, MIMIC) 都不使用 -1 标签
+            use_difficult = False 
+        
+        self.meter['ap'] = metric.AveragePrecisionMeter(difficult_examples=use_difficult)
+        # --- 修改结束 ---
 
 
 if __name__ == '__main__':

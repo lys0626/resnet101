@@ -11,10 +11,12 @@ from utilities.voc import VOC2007, VOC2012
 from utilities import utils_ddp
 import torch.distributed as dist
 from utilities.nih import nihchest
+from utilities.mimic import MIMICCXR # 假设类名是 MIMICCXR
+from utilities.chexpert import chexpert # 假设类名是 chexpert
 opj = os.path.join
 
 def init(args):
-    # --- 2. DDP 和 GPU 设置 (替换旧的 os.environ 设置) ---
+    # --- DDP 和 GPU 设置 ---
     if 'LOCAL_RANK' in os.environ:
         # --- 多 GPU 模式 (由 torchrun 启动) ---
         args.distributed = True
@@ -34,12 +36,13 @@ def init(args):
         args.world_size = 1
         
         # 使用 -cd 参数设置可见的 GPU
-        # (如果 -cd 0 1，只使用第一个: 0)
         gpu_id = str(args.cuda_devices[0]) 
         os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
         torch.cuda.set_device(0) # 此时设备 0 就是 'gpu_id'
         print(f'Single-GPU init: using GPU {gpu_id}')
-    if args.master_port == '17837':  # randomly selecting a prot
+
+    # --- 端口和工作进程设置 ---
+    if args.master_port == '17837': # 随机选择一个端口
         import socket
         s=socket.socket()
         s.bind(("", 0))
@@ -52,15 +55,16 @@ def init(args):
 
     set_seed(args.seed)
 
+    # --- 路径和日志设置 ---
     args.model = args.model.replace('-', '_')
     model_name = args.model + (('_' + args.remark) if args.remark != '' else '')
     data_set = args.data_set
 
     args.save_path = opj(args.save_dir, data_set, model_name)
     args.start_time = time.strftime('%Y-%m-%d-%H-%M', time.localtime(time.time()))
-    if args.rank == 0: # <--- 5. 确保只在主进程创建目录
+    if args.rank == 0: # 只在主进程创建目录和复制文件
         os.makedirs(opj(args.save_path, 'log'), exist_ok=True)
-        # (文件复制逻辑可以保持不变，因为它也在 'rank == 0' 的保护下)
+        # 复制模型定义文件以供参考
         file_name = model_name + f'_lr{args.lr:.1e}_' + args.start_time + '.py'
         shutil.copyfile(opj('models', args.model + '.py'),
                         opj(args.save_path, 'log', file_name))
@@ -73,27 +77,26 @@ def set_seed(seed=95):
         random.seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
-            cudnn.deterministic = False  # If true, the speed may be low referring to https://pytorch.org/docs/stable/notes/randomness.html.
+            cudnn.deterministic = False # If true, the speed may be low
             torch.backends.cudnn.benchmark = True
 
 def get_dataloader(train_set=None, test_set=None, args=None):
-    # train_set, test_set, num_classes = get_dataset(args)
     pin_memory = False
     train_loader, test_loader = None, None
     if train_set != None:
-        if args.distributed: # <--- 检查 args.distributed
+        if args.distributed: # DDP 模式
             train_sampler = DistributedSampler(dataset=train_set, shuffle=True)
-        else:
-            train_sampler = None # (单 GPU 模式不需要 DDP sampler)
+        else: # 单 GPU 模式
+            train_sampler = None
             
         train_loader = DataLoader(train_set, batch_size=args.batch_size_per,
                                   num_workers=args.num_workers, pin_memory=pin_memory,
                                   drop_last=True, sampler=train_sampler, collate_fn=None,
-                                  shuffle=(train_sampler is None)) # <--- 8. 如果 sampler 为 None，则启用 shuffle
+                                  shuffle=(train_sampler is None)) # 只有在非DDP时才启用 shuffle
     if test_set != None:
-        if args.distributed: # <--- 检查 args.distributed
+        if args.distributed: # DDP 模式
             test_sampler = DistributedSampler(dataset=test_set, shuffle=False)
-        else:
+        else: # 单 GPU 模式
             test_sampler = None
             
         test_loader = DataLoader(test_set, batch_size=args.batch_size_per,
@@ -102,7 +105,8 @@ def get_dataloader(train_set=None, test_set=None, args=None):
     return train_loader, test_loader
 
 def get_dataset(args):
-    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest}
+    # --- MODIFIED: data_dict 现在包含所有新数据集
+    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':MIMICCXR, 'CHEXPERT':chexpert}
     test_transfm = get_transform(args, is_train=False)
     train_transfm = get_transform(args, is_train=True)
 
@@ -110,18 +114,31 @@ def get_dataset(args):
         data_dir = opj(args.data_root, 'COCO2014')
         test_set = data_dict[args.data_set](data_dir, phase='val', transform=test_transfm)
         train_set = data_dict[args.data_set](data_dir, phase='train',
-                                             transform=train_transfm)
+                                              transform=train_transfm)
     elif args.data_set in ('VOC2007'):
         data_dir = opj(args.data_root, 'VOC2007')
         test_set = data_dict[args.data_set](data_dir, phase='test',
-                                            transform=test_transfm)
+                                              transform=test_transfm)
         train_set = data_dict[args.data_set](data_dir, phase='trainval',
-                                            transform=train_transfm)
+                                              transform=train_transfm)
     elif args.data_set in ('NIH-CHEST'):
         data_dir = args.data_root
-        #将test_set指向验证集，以用于训练期间的评估
+        # NIH-CHEST 使用 'valid' 模式 (val_list.txt) 进行训练时验证
         test_set = data_dict[args.data_set](data_dir, mode='valid', transform=test_transfm)
         train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+    
+    # --- MODIFIED: 合并了 MIMIC 和 CHEXPERT 的逻辑
+    elif args.data_set in ('MIMIC', 'CHEXPERT'):
+        data_dir = args.data_root # 假设根目录设置正确
+        # MIMIC (JSON-based [cite: image_e1cd19.png]) 和 CHEXPERT (假设) 没有验证集
+        # 因此在训练时使用 'test' 模式进行验证
+        test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+        train_set = data_dict[args.data_set](data_dir, mode='train', transform=train_transfm)
+    else:
+        raise ValueError(f"未知的数据集: {args.data_set}")
+
+    # --- MODIFIED: 修复了 BUG ---
+    # `num_classes` 必须在 if/elif 链之外
     num_classes = train_set.get_number_classes()
     return train_set, test_set, num_classes
 
@@ -193,7 +210,7 @@ def strftime(x):
         s = '!!So long time, can not be converted.!!'
     return s
 
-def ignore_warning():  # not working
+def ignore_warning(): # not working
     import warnings
     warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step()` before `optimizer.step()`. ")
 
@@ -248,22 +265,22 @@ class MultiScaleCrop(object):
         h_step = (image_h - crop_h) // 4
 
         ret = list()
-        ret.append((0, 0))  # upper left
-        ret.append((4 * w_step, 0))  # upper right
-        ret.append((0, 4 * h_step))  # lower left
-        ret.append((4 * w_step, 4 * h_step))  # lower right
-        ret.append((2 * w_step, 2 * h_step))  # center
+        ret.append((0, 0)) # upper left
+        ret.append((4 * w_step, 0)) # upper right
+        ret.append((0, 4 * h_step)) # lower left
+        ret.append((4 * w_step, 4 * h_step)) # lower right
+        ret.append((2 * w_step, 2 * h_step)) # center
 
         if more_fix_crop:
-            ret.append((0, 2 * h_step))  # center left
-            ret.append((4 * w_step, 2 * h_step))  # center right
-            ret.append((2 * w_step, 4 * h_step))  # lower center
-            ret.append((2 * w_step, 0 * h_step))  # upper center
+            ret.append((0, 2 * h_step)) # center left
+            ret.append((4 * w_step, 2 * h_step)) # center right
+            ret.append((2 * w_step, 4 * h_step)) # lower center
+            ret.append((2 * w_step, 0 * h_step)) # upper center
 
-            ret.append((1 * w_step, 1 * h_step))  # upper left quarter
-            ret.append((3 * w_step, 1 * h_step))  # upper right quarter
-            ret.append((1 * w_step, 3 * h_step))  # lower left quarter
-            ret.append((3 * w_step, 3 * h_step))  # lower righ quarter
+            ret.append((1 * w_step, 1 * h_step)) # upper left quarter
+            ret.append((3 * w_step, 1 * h_step)) # upper right quarter
+            ret.append((1 * w_step, 3 * h_step)) # lower left quarter
+            ret.append((3 * w_step, 3 * h_step)) # lower righ quarter
 
         return ret
 
@@ -283,5 +300,3 @@ if __name__ == '__main__':
     i, a = next(enumerate(train_loader))
 
     a = 'pause'
-
-

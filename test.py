@@ -14,6 +14,17 @@ opj = os.path.join
 from utilities.coco import COCO2014
 from utilities.voc import VOC2007
 from utilities.nih import nihchest
+from utilities.mimic import mimic
+from utilities.chexpert import chexpert
+# [新添加] 尝试导入 MIMIC 和 CheXpert
+try:
+    from utilities.mimic import mimic
+    from utilities.chexpert import chexpert
+    MIMIC_IMPORTED = True
+    CHEXPERT_IMPORTED = True
+except ImportError:
+    MIMIC_IMPORTED = False
+    CHEXPERT_IMPORTED = False
 
 
 def run_evaluation(args):
@@ -45,7 +56,19 @@ def run_evaluation(args):
         
     test_transfm = get_transform(args, is_train=False)
     
-    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007, 'NIH-CHEST': nihchest}
+    # --- [修改开始] ---
+    # 动态构建 data_dict
+    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007, 'NIH-CHEST': nihchest,'MIMIC':mimic,'CHEXPERT':chexpert}
+    if MIMIC_IMPORTED:
+        data_dict['MIMIC'] = mimic
+    if CHEXPERT_IMPORTED:
+        data_dict['CHEXPERT'] = chexpert
+    
+    
+    if args.data_set not in data_dict:
+         raise ValueError(f"数据集 {args.data_set} 未在 test.py 中配置或无法导入 (e.g., utilities/mimic.py)")
+    # --- [修改结束] ---
+
     data_dir = args.data_root 
     
     if args.data_set in ('MS-COCO'):
@@ -56,8 +79,13 @@ def run_evaluation(args):
         real_test_set = data_dict[args.data_set](data_dir, phase='test', transform=test_transfm)
     elif args.data_set in ('NIH-CHEST'):
         real_test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm) # <--- 显式使用 'test'
+    # --- [修改开始] ---
+    elif args.data_set in ('MIMIC', 'CHEXPERT'):
+        # 假设 MIMIC 和 CheXpert 都使用 'test' 模式
+        real_test_set = data_dict[args.data_set](data_dir, mode='test', transform=test_transfm)
+    # --- [修改结束] ---
     else:
-        raise ValueError(f"数据集 {args.data_set} 未在 test.py 中配置")
+        raise ValueError(f"数据集 {args.data_set} 的加载逻辑未在 test.py 中配置")
 
     # 5. --- 创建 "测试" Dataloader ---
     if args.distributed:
@@ -80,7 +108,16 @@ def run_evaluation(args):
 
     # 6. --- 手动运行评估循环 ---
     model.eval()
-    ap_meter = metric.AveragePrecisionMeter()
+    
+    # --- [修改开始] ---
+    # 根据数据集设置 difficult_examples
+    if args.data_set == 'VOC2007':
+        ap_meter = metric.AveragePrecisionMeter(difficult_examples=True)
+    else:
+        # 适用于 NIH-CHEST, MIMIC, CHEXPERT, MS-COCO
+        ap_meter = metric.AveragePrecisionMeter(difficult_examples=False)
+    # --- [修改结束] ---
+    
     loss_meter = metric.AverageMeter('loss_test')
 
     if args.rank == 0:
@@ -126,10 +163,23 @@ def run_evaluation(args):
     # 7. --- 在主进程中打印最终结果 ---
     if args.rank == 0:
         loss = loss_meter.average()
-        (mAP, AP) = ap_meter.mAP()
+        
+        # --- [修改开始] ---
+        auroc_datasets = ['NIH-CHEST', 'MIMIC', 'CHEXPERT']
+        
+        if args.data_set.upper() in auroc_datasets:
+            # 对于 NIH, MIMIC, CheXpert，使用 AUROC
+            (main_metric, AP_or_AUC_list) = ap_meter.auroc(engine.args.num_classes)
+            metric_name = 'AUROC'
+        else:
+            # 对于其他 (VOC, COCO)，使用 mAP
+            (main_metric, AP_or_AUC_list) = ap_meter.mAP()
+            metric_name = 'mAP'
+        # --- [修改结束] ---
+
         OP, OR, OF1, CP, CR, CF1 = ap_meter.overall()
         
-        str_precision = f'OF1:{OF1:.2f}, CF1:{CF1:.2f}, mAP:{mAP:.4f}'
+        str_precision = f'OF1:{OF1:.2f}, CF1:{CF1:.2f}, {metric_name}:{main_metric:.4f}'
         print(f"\n--- [ 最终测试结果 ] ---")
         print(f"Checkpoint: {args.resume}")
         print(f"Loss: {loss:.4f}, {str_precision}")
@@ -140,7 +190,7 @@ def run_evaluation(args):
                       f'OP_{args.acc_top_k}: {OP_k:.2f}, OR_{args.acc_top_k}: {OR_k:.2f}, OF1_{args.acc_top_k}: {OF1_k:.2f}\n' \
                       f'CP_{args.acc_top_k}: {CP_k:.2f}, CR_{args.acc_top_k}: {CR_k:.2f}, CF1_{args.acc_top_k}: {CF1_k:.2f}\n'
         print(str_verbose)
-        print(f"所有类别的 AP:\n{AP}")
+        print(f"所有类别的 {metric_name} (或 AP):\n{AP_or_AUC_list}")
 
     if args.distributed:
         utils_ddp.cleanup()

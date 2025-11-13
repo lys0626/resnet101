@@ -2,5 +2,6 @@
 *.sh
 *.tar
 /Etc
+/README.md
 *.pyc
 /wandb
