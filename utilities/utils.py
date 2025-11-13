@@ -11,7 +11,7 @@ from utilities.voc import VOC2007, VOC2012
 from utilities import utils_ddp
 import torch.distributed as dist
 from utilities.nih import nihchest
-from utilities.mimic import MIMICCXR # 假设类名是 MIMICCXR
+from utilities.mimic import mimic # 假设类名是 mimic
 from utilities.chexpert import chexpert # 假设类名是 chexpert
 opj = os.path.join
 
@@ -106,7 +106,7 @@ def get_dataloader(train_set=None, test_set=None, args=None):
 
 def get_dataset(args):
     # --- MODIFIED: data_dict 现在包含所有新数据集
-    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':MIMICCXR, 'CHEXPERT':chexpert}
+    data_dict = {'MS-COCO': COCO2014, 'VOC2007': VOC2007,'NIH-CHEST':nihchest, 'MIMIC':mimic, 'CHEXPERT':chexpert}
     test_transfm = get_transform(args, is_train=False)
     train_transfm = get_transform(args, is_train=True)
 
