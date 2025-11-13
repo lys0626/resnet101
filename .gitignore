@@ -1,0 +1,6 @@
+/checkpoint
+*.sh
+*.tar
+/Etc
+*.pyc
+/wandb
